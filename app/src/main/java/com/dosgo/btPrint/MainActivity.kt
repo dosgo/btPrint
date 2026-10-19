@@ -33,10 +33,12 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.dosgo.btPrint.bluetooth.PrintJobLock
 import com.dosgo.btPrint.bluetooth.PrinterConnector
 import com.dosgo.btPrint.bluetooth.PrinterTransport
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import kotlin.math.roundToInt
 import kotlin.concurrent.thread
 
@@ -57,8 +59,10 @@ class MainActivity : AppCompatActivity() {
 
     // 打印锁：整条链路（渲染 → 连接 → 分幅下发 → 走纸）是串行的，
     // 重复点击会让第二份指令插进蓝牙栈，打印机要么丢数据要么锁死。
-    @Volatile
-    private var isPrinting = false
+    // 锁放在进程级单例里，adb 开出第二个 Activity 实例时同样有效。
+    /** 是否正有打印任务在跑 */
+    private val isPrinting: Boolean
+        get() = PrintJobLock.isBusy
 
     private var selectedPdfUri: Uri? = null
     private var preparedPrintData: PreparedPrintData? = null
@@ -182,19 +186,30 @@ class MainActivity : AppCompatActivity() {
             override fun onNothingSelected(parent: AdapterView<*>?) = Unit
         }
 
-        findViewById<Button>(R.id.btnSelectPdf).setOnClickListener {
+        btnSelectPdf = findViewById(R.id.btnSelectPdf)
+        btnPrint = findViewById(R.id.btnPrint)
+        btnTestPrint = findViewById(R.id.btnTestPrint)
+        btnRefreshDevices = findViewById(R.id.btnRefreshDevices)
+
+        btnSelectPdf.setOnClickListener {
             selectPdfLauncher.launch("application/pdf")
         }
 
-        findViewById<Button>(R.id.btnPrint).setOnClickListener {
+        btnPrint.setOnClickListener {
             startPrintFlow()
         }
 
-        findViewById<Button>(R.id.btnRefreshDevices).setOnClickListener {
-            if (hasBluetoothPermissions()) refreshDeviceList() else checkAndRequestPermissions()
+        btnRefreshDevices.setOnClickListener {
+            if (isPrinting) {
+                tvBtState.text = "打印中，暂不能重新搜索设备"
+            } else if (hasBluetoothPermissions()) {
+                refreshDeviceList()
+            } else {
+                checkAndRequestPermissions()
+            }
         }
 
-        findViewById<Button>(R.id.btnTestPrint).setOnClickListener {
+        btnTestPrint.setOnClickListener {
             startTestPrint()
         }
 
@@ -252,6 +267,17 @@ class MainActivity : AppCompatActivity() {
         val b64 = source?.getStringExtra("test_b64")
         pendingDebugCmd = source?.getStringExtra("test_cmd") ?: b64?.let {
             runCatching { String(Base64.decode(it, Base64.DEFAULT), Charsets.UTF_8) }.getOrNull()
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // 打印在工作线程里跑，界面可能被重建（转屏 / 从选择器返回 / 又开了一个实例），
+        // 回到前台时先把按钮状态和进程级锁对齐，避免出现"锁被占着但按钮可点"。
+        setBusyUi(isPrinting)
+        if (isPrinting) {
+            tvBtState.text =
+                "打印中：「${PrintJobLock.currentJob ?: "打印任务"}」，请勿重复点击"
         }
     }
 
@@ -408,6 +434,8 @@ class MainActivity : AppCompatActivity() {
             return
         }
         Log.i("BtPrint", "调试直连 $mac，指令=${rawCmd ?: "<测试页>"}，节流=${throttleMs}ms/512B")
+        // adb 连发两条 am start 也是并发来源，同样要走打印锁
+        if (!acquirePrintLock("调试下发")) return
         tvLog.text = "调试发送中..."
         thread {
             try {
@@ -451,6 +479,8 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 e.printStackTrace()
                 runOnUiThread { tvLog.text = "调试发送失败: ${e.message}" }
+            } finally {
+                releasePrintLock()
             }
         }
     }
@@ -537,16 +567,65 @@ class MainActivity : AppCompatActivity() {
     private fun safeDeviceName(dev: BluetoothDevice): String =
         runCatching { dev.name }.getOrNull() ?: "未知设备"
 
+    // ---- 打印锁 ----
+
+    /**
+     * 抢占打印锁。同一时刻只允许一份任务在跑：打印中再次点击「打印 / 测试页 /
+     * 调试下发」都会被直接拒绝，不会产生第二条连接，也不会往同一条通道里插指令。
+     * 必须在主线程调用（按钮回调本来就在主线程）。
+     */
+    private fun acquirePrintLock(job: String): Boolean {
+        val holder = PrintJobLock.tryAcquire(job)
+        if (holder != null) {
+            val msg = "「$holder」还没打完，等它结束再点（打印过程中不允许重复下发）"
+            tvLog.text = msg
+            tvBtState.text = "打印中：「$holder」"
+            Log.w("BtPrint", "拒绝并发请求[$job]，当前正在执行[$holder]")
+            return false
+        }
+        setBusyUi(true)
+        tvBtState.text = "打印中：「$job」，请勿重复点击"
+        return true
+    }
+
+    /** 释放打印锁。可能在工作线程上调用，UI 状态切回主线程。 */
+    private fun releasePrintLock() {
+        PrintJobLock.release()
+        runOnUiThread {
+            setBusyUi(false)
+            tvBtState.text = "空闲，可以打印下一份"
+        }
+    }
+
+    /**
+     * 打印期间锁住会破坏当前任务的操作：重复打印、换设备、换纸规、重新选文件。
+     * 换纸规会触发重新渲染，换设备/搜索会打断 RFCOMM 握手。
+     */
+    private fun setBusyUi(busy: Boolean) {
+        btnPrint.isEnabled = !busy
+        btnTestPrint.isEnabled = !busy
+        btnRefreshDevices.isEnabled = !busy
+        btnSelectPdf.isEnabled = !busy
+        spinnerDevices.isEnabled = !busy
+        spinnerLabelSize.isEnabled = !busy
+        etPaperLength.isEnabled = !busy
+        btnPrint.text = if (busy) "打印中…（请等待）" else "4. 开始高清打印"
+    }
+
     private fun startPrintFlow() {
+        // 先抢锁再校验：打印中点击应该提示"还没打完"，而不是被当成参数错误
+        if (!acquirePrintLock("打印 PDF")) return
         val uri = selectedPdfUri
         if (uri == null) {
             tvLog.text = "请先选择 PDF 文件！"
+            releasePrintLock()
             return
         }
         val targetDevice = deviceList.getOrNull(spinnerDevices.selectedItemPosition)
         if (targetDevice == null) {
             tvLog.text = "请先选择一个蓝牙打印机（点上方刷新重新搜索）"
             Log.w("BtPrint", "设备列表为空，无法打印。当前列表大小=${deviceList.size}")
+            releasePrintLock()
             return
         }
         Log.i(
@@ -588,16 +667,21 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 e.printStackTrace()
                 runOnUiThread { tvLog.text = "打印失败: ${e.message}" }
+            } finally {
+                // 失败也要解锁，否则一次异常就把整个 App 的打印功能锁死
+                releasePrintLock()
             }
         }
     }
 
     /** 不依赖 PDF 的最小测试页。能打出来说明通道和指令都对，问题在点阵数据本身。 */
     private fun startTestPrint() {
+        if (!acquirePrintLock("发送测试页")) return
         val targetDevice = deviceList.getOrNull(spinnerDevices.selectedItemPosition)
         if (targetDevice == null) {
             tvLog.text = "请先选择一个蓝牙打印机（点上方刷新重新搜索）"
             Log.w("BtPrint", "设备列表为空，无法发测试页")
+            releasePrintLock()
             return
         }
         Log.i("BtPrint", "发送测试页到 ${safeDeviceName(targetDevice)} (${targetDevice.address})")
@@ -615,28 +699,68 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 e.printStackTrace()
                 runOnUiThread { tvLog.text = "测试页失败: ${e.message}" }
+            } finally {
+                releasePrintLock()
             }
         }
     }
 
-    /** 连接 → 执行 → 关闭，统一处理日志与生命周期。 */
+    /** 取连接 → 探活 → 执行 → 归还/作废，统一处理日志与重试。 */
     private fun connectAndRun(
         device: BluetoothDevice,
         throttleMs: Int = PrinterConnector.DEFAULT_THROTTLE_MS,
         job: (PrinterTransport) -> String
     ) {
-        val transport = PrinterConnector.connect(this, device, { msg ->
-            Log.i("BtPrint", msg)
-            runOnUiThread { tvLog.text = msg }
-        }, throttleMs)
-        try {
-            val result = job(transport)
-            runOnUiThread { tvLog.text = result }
-        } finally {
-            // 关闭前再留一点余量，避免最后几条指令还在栈里就被丢弃
-            Thread.sleep(500)
-            transport.close()
+        var lastError: IOException? = null
+        var attempt = 0
+        var retryDelay = 0L
+        while (attempt < SEND_ATTEMPTS) {
+            attempt++
+            if (retryDelay > 0L) {
+                Log.w("BtPrint", "等 ${retryDelay}ms 让打印机复位后重连")
+                runCatching { Thread.sleep(retryDelay) }
+            }
+            val transport = PrinterConnector.acquire(this, device, { msg ->
+                Log.i("BtPrint", msg)
+                runOnUiThread { tvLog.text = msg }
+            }, throttleMs)
+            var handedOver = false
+            try {
+                // 探活：TSPL 下空行是空操作。上一份打完对面把 socket 关掉时，
+                // 这里立刻抛 EPIPE(Broken pipe)，此时还没发任何真实数据，重建连接最安全。
+                transport.write(PROBE_LINE)
+                val result = job(transport)
+                // 正常打完：交还连接，窗口期内下一份直接复用，不重连就不会 broken pipe
+                PrinterConnector.release(transport)
+                handedOver = true
+                runOnUiThread { tvLog.text = result }
+                return
+            } catch (e: IOException) {
+                lastError = e
+                val sent = transport.bytesSent
+                val realSent = (sent - PROBE_LINE.size).coerceAtLeast(0L)
+                // 只有"真实数据一个字节都没发出去"才重发：那时打印机没收到指令，
+                // 整份重发不会多出一张纸；已经发过一半（可能已发过 PRINT）就绝不重试。
+                val retryable = attempt < SEND_ATTEMPTS && realSent == 0L
+                Log.w(
+                    "BtPrint",
+                    "第 $attempt 次下发失败（实发 $realSent 字节）：${e.message}" +
+                        if (retryable) "，重建连接后整份重发" else "，不再重试"
+                )
+                if (!retryable) throw e
+                runOnUiThread {
+                    tvLog.text = "连接已失效（${e.message}），正在重连重发…"
+                }
+                // 打印机刚断链时往往还在走纸/复位，给个递增退避再握手，避免又拿到死通道。
+                // 注意：这里只记延迟，真正 sleep 在下一轮开头——必须先把这条通道关掉。
+                retryDelay = 800L * attempt
+            } finally {
+                // 成功时已经 release（连接保留），其余情况一律作废，下次重新握手
+                if (!handedOver) PrinterConnector.invalidate(transport)
+            }
         }
+        throw lastError
+            ?: IOException("重试 $SEND_ATTEMPTS 次仍未发出数据，打印机可能已关机或不在范围")
     }
 
     private fun buildTestPageCommand(): ByteArray {
@@ -1076,5 +1200,12 @@ class MainActivity : AppCompatActivity() {
         private const val FINAL_SEGMENT_WAIT_MS = 3000L
         // 批量测试里两张之间的间隔
         private const val BATCH_GAP_MS = 6000L
+        // 一份任务最多下发几次。只在"一个字节都没发出去"时重试（换新通道整份重发），
+        // 覆盖上一份打完立刻再打时 socket 已被对面关闭、首写即 EPIPE 的情况。
+        private const val SEND_ATTEMPTS = 3
+
+        // 探活用。TSPL 里空行是空操作，不会出纸、不影响画布，
+        // 但足以把一个"对面已断"的 socket 的 EPIPE 提前暴露出来。
+        private val PROBE_LINE = "\r\n".toByteArray(Charsets.US_ASCII)
     }
 }
