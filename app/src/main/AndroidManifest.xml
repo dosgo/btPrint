@@ -10,7 +10,9 @@
 
     <application
         android:allowBackup="true"
+        android:icon="@mipmap/ic_btprint"
         android:label="LabelPrint"
+        android:roundIcon="@mipmap/ic_btprint"
         android:theme="@style/Theme.BtPrint">
         <activity
             android:name=".MainActivity"
