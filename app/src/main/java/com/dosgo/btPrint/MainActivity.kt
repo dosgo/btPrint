@@ -8,13 +8,15 @@ import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Matrix
-import android.graphics.pdf.PdfRenderer
+import android.graphics.Paint
+import android.graphics.Rect
+import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.ParcelFileDescriptor
+import android.util.Log
 import android.view.View
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
@@ -25,8 +27,13 @@ import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
+import io.legere.pdfiumandroid.PdfPage
+import io.legere.pdfiumandroid.PdfiumCore
+import java.io.File
+import java.io.FileOutputStream
 import java.io.OutputStream
 import java.util.UUID
+import kotlin.math.roundToInt
 import kotlin.concurrent.thread
 
 class MainActivity : AppCompatActivity() {
@@ -72,16 +79,7 @@ class MainActivity : AppCompatActivity() {
 
     // 文件选择器
     private val selectPdfLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        if (uri != null) {
-            selectedPdfUri = uri
-            preparedPrintData = null
-            ivPrintPreview.setImageDrawable(null)
-            ivPrintPreview.visibility = View.GONE
-            tvPreviewLabel.visibility = View.GONE
-            tvPdfStatus.text = "正在生成打印预览: ${uri.lastPathSegment}"
-            tvLog.text = "正在按 203 DPI 渲染第一页..."
-            preparePreview(uri, selectedLabelSize())
-        }
+        if (uri != null) openPdf(uri)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -123,6 +121,19 @@ class MainActivity : AppCompatActivity() {
         }
 
         checkAndRequestPermissions()
+
+        intent?.data?.let(::openPdf)
+    }
+
+    private fun openPdf(uri: Uri) {
+        selectedPdfUri = uri
+        preparedPrintData = null
+        ivPrintPreview.setImageDrawable(null)
+        ivPrintPreview.visibility = View.GONE
+        tvPreviewLabel.visibility = View.GONE
+        tvPdfStatus.text = "正在生成打印预览: ${uri.lastPathSegment}"
+        tvLog.text = "正在按 203 DPI 渲染第一页..."
+        preparePreview(uri, selectedLabelSize())
     }
 
     private fun selectedLabelSize(): LabelSize =
@@ -224,44 +235,145 @@ class MainActivity : AppCompatActivity() {
 
     private fun preparePrintData(uri: Uri, labelSize: LabelSize): PreparedPrintData {
         val bitmap = renderPdfToBitmap(uri, labelSize.widthDots, labelSize.heightDots)
+        FileOutputStream(File(cacheDir, "render-debug.png")).use {
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, it)
+        }
         val (bitmapData, widthInBytes) = convertBitmapTo1BitTspl(bitmap)
         val preview = createPreviewFromTspl(bitmapData, bitmap.width, bitmap.height, widthInBytes)
         bitmap.recycle()
         return PreparedPrintData(uri, labelSize, bitmapData, widthInBytes, preview.height, preview)
     }
 
-    // 核心渲染：按物理点阵分辨率 1:1 输出，保证不模糊且字体完整
+    // 使用 PDFium 渲染。Android 系统 PdfRenderer 会错误处理部分 CID/中文字体，
+    // 表现为中文字形消失、英文字距挤压；PDFium 能按 PDF 自带字形正确栅格化。
     private fun renderPdfToBitmap(uri: Uri, targetWidth: Int, targetHeight: Int): Bitmap {
         val pfd = contentResolver.openFileDescriptor(uri, "r") ?: throw Exception("无法读取 PDF")
-        try {
-            val renderer = PdfRenderer(pfd)
-            try {
-                val page = renderer.openPage(0)
-                try {
+        pfd.use { descriptor ->
+            val pdfium = PdfiumCore(this)
+            pdfium.newDocument(descriptor).use { document ->
+                val page = document.openPage(0) ?: throw Exception("PDF 没有可渲染的页面")
+                page.use {
+                    val pageWidth = page.getPageWidthPoint()
+                    val pageHeight = page.getPageHeightPoint()
+                    if (pageWidth <= 0 || pageHeight <= 0) throw Exception("PDF 页面尺寸无效")
+
                     val bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
                     bitmap.eraseColor(Color.WHITE)
 
                     val scale = minOf(
-                        targetWidth.toFloat() / page.width,
-                        targetHeight.toFloat() / page.height
+                        targetWidth.toFloat() / pageWidth,
+                        targetHeight.toFloat() / pageHeight
                     )
-                    val offsetX = (targetWidth - page.width * scale) / 2f
-                    val offsetY = (targetHeight - page.height * scale) / 2f
-                    val transform = Matrix().apply {
-                        setScale(scale, scale)
-                        postTranslate(offsetX, offsetY)
-                    }
-                    page.render(bitmap, null, transform, PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
+                    val drawWidth = (pageWidth * scale).roundToInt().coerceAtLeast(1)
+                    val drawHeight = (pageHeight * scale).roundToInt().coerceAtLeast(1)
+                    val offsetX = (targetWidth - drawWidth) / 2
+                    val offsetY = (targetHeight - drawHeight) / 2
+
+                    page.renderPageBitmap(
+                        bitmap = bitmap,
+                        startX = offsetX,
+                        startY = offsetY,
+                        drawSizeX = drawWidth,
+                        drawSizeY = drawHeight,
+                        renderAnnot = true,
+                        canvasColor = Color.WHITE,
+                        pageBackgroundColor = Color.WHITE
+                    )
+                    overlayMissingCjkGlyphs(
+                        bitmap = bitmap,
+                        page = page,
+                        pageWidth = pageWidth,
+                        pageHeight = pageHeight,
+                        offsetX = offsetX,
+                        offsetY = offsetY,
+                        drawWidth = drawWidth,
+                        drawHeight = drawHeight
+                    )
                     return bitmap
-                } finally {
-                    page.close()
                 }
-            } finally {
-                renderer.close()
             }
-        } finally {
-            pfd.close()
         }
+    }
+
+    // 部分物流标签 PDF（例如 iText 的 STSong-Light）只引用中文字体名称，
+    // 却不嵌入字体。PDFium 仍能读出字符及其准确坐标，因此使用 Android
+    // 自带的 CJK 字体把缺失字形补到原位置，再进入统一的 1-bit 点阵流程。
+    private fun overlayMissingCjkGlyphs(
+        bitmap: Bitmap,
+        page: PdfPage,
+        pageWidth: Int,
+        pageHeight: Int,
+        offsetX: Int,
+        offsetY: Int,
+        drawWidth: Int,
+        drawHeight: Int
+    ) {
+        val canvas = Canvas(bitmap)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.BLACK
+            typeface = Typeface.create("serif", Typeface.NORMAL)
+            textAlign = Paint.Align.LEFT
+            textSize = 1000f
+        }
+        val glyphBounds = Rect()
+
+        page.openTextPage().use { textPage ->
+            val count = textPage.textPageCountChars()
+            val extractedText = textPage.textPageGetText(0, count).orEmpty()
+            var cjkGlyphCount = 0
+            val cjkDebug = StringBuilder()
+            for (index in 0 until count) {
+                val character = textPage.textPageGetUnicode(index)
+                if (!isCjkCharacter(character) || character.isWhitespace()) continue
+
+                val box = textPage.textPageGetCharBox(index) ?: continue
+                val targetLeft = offsetX + box.left / pageWidth * drawWidth
+                val targetRight = offsetX + box.right / pageWidth * drawWidth
+                val targetGlyphWidth = targetRight - targetLeft
+                val targetBaseline = offsetY + (pageHeight - box.bottom) / pageHeight * drawHeight
+                val targetFontSize = textPage.getFontSize(index).toFloat() / pageHeight * drawHeight
+                if (targetGlyphWidth <= 0f || targetFontSize <= 0f) continue
+
+                val text = character.toString()
+                paint.textSize = targetFontSize
+                paint.getTextBounds(text, 0, text.length, glyphBounds)
+                if (glyphBounds.width() <= 0 || glyphBounds.height() <= 0) continue
+
+                canvas.save()
+                canvas.translate(targetLeft, targetBaseline)
+                canvas.scale(targetGlyphWidth / glyphBounds.width(), 1f)
+                canvas.drawText(
+                    text,
+                    -glyphBounds.left.toFloat(),
+                    0f,
+                    paint
+                )
+                canvas.restore()
+                if (cjkGlyphCount < 5) {
+                    cjkDebug.append(character)
+                        .append(':').append(box.left).append(',').append(box.bottom)
+                        .append(',').append(box.right).append(',').append(box.top)
+                        .append(" -> x=").append(targetLeft).append("..").append(targetRight)
+                        .append(" baseline=").append(targetBaseline)
+                        .append(" size=").append(targetFontSize)
+                        .append("; ")
+                }
+                cjkGlyphCount++
+            }
+            Log.i(
+                "BtPrintRenderer",
+                "characters=$count cjkGlyphs=$cjkGlyphCount boxes=$cjkDebug text=${extractedText.replace('\n', ' ')}"
+            )
+        }
+    }
+
+    private fun isCjkCharacter(character: Char): Boolean {
+        val code = character.code
+        return code in 0x3400..0x4DBF ||
+            code in 0x4E00..0x9FFF ||
+            code in 0xF900..0xFAFF ||
+            code in 0x3000..0x303F ||
+            code in 0xFF00..0xFFEF
     }
 
     // 核心算法：1-bit 硬二值化点阵编码（TSPL BITMAP 规范）
