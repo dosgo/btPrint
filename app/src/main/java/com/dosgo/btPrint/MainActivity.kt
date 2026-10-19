@@ -104,6 +104,9 @@ class MainActivity : AppCompatActivity() {
     private var pendingPdfH = 150
     // 渲染引擎：pdfium（内置，缺字体时靠补字） / system（系统 PdfRenderer，带字体回退）
     private var pendingRenderEngine = "pdfium"
+    // 上一次渲染的 PDF 页面尺寸（PDF 单位 1/72 英寸），用于在界面上显示"PDF 有多大"
+    private var lastPageWidthPt = 0f
+    private var lastPageHeightPt = 0f
     // 只渲染不打印，调渲染效果时避免浪费纸
     private var pendingRenderOnly = false
     // 调试用：缩放到纸张
@@ -121,6 +124,7 @@ class MainActivity : AppCompatActivity() {
     private val labelSizes = listOf(
         LabelSize(100, 100), // 100×100 标签纸（常用，实际可打 99mm）
         LabelSize(102, 152), // 4×6 英寸面单纸
+        LabelSize(108, 152),
         LabelSize(100, 150), // 4×6 面单原始比例（可打 99mm）
         LabelSize(100, 50),
         LabelSize(100, 30),
@@ -136,7 +140,10 @@ class MainActivity : AppCompatActivity() {
         val heightDots: Int,
         val previewBitmap: Bitmap,
         // 是否是「缩放到纸张」模式（同规格下两种模式的点阵不同，缓存要区分）
-        val scaledToPaper: Boolean = false
+        val scaledToPaper: Boolean = false,
+        // PDF 页面原始尺寸（mm），显示用
+        val pdfWidthMm: Int = 0,
+        val pdfHeightMm: Int = 0
     )
 
     // 文件选择器
@@ -341,16 +348,21 @@ class MainActivity : AppCompatActivity() {
                     ivPrintPreview.setImageBitmap(prepared.previewBitmap)
                     ivPrintPreview.visibility = View.VISIBLE
                     val clipped = prepared.heightDots < prepared.previewBitmap.height
+                    val pdfSize = "PDF ${prepared.pdfWidthMm}×${prepared.pdfHeightMm}mm"
+                    val paperSize = "纸张 ${labelSize.widthMm}×${labelSize.heightMm}mm"
                     tvPreviewLabel.text = when {
-                        prepared.scaledToPaper -> "缩放到纸张后的预览（整页塞进一张纸）"
-                        clipped -> "PDF 整页预览（红虚线以下超出纸张，不会打印）"
-                        else -> "PDF 整页预览（整页都在纸内）"
+                        prepared.scaledToPaper ->
+                            "$pdfSize 缩放到 $paperSize（整页塞进一张纸）"
+                        clipped ->
+                            "$pdfSize 整页预览 · $paperSize（红虚线以下超出纸张，不会打印）"
+                        else ->
+                            "$pdfSize 整页预览 · $paperSize（整页都在纸内）"
                     }
                     tvPreviewLabel.visibility = View.VISIBLE
-                    tvPdfStatus.text = "已选文件: ${uri.lastPathSegment}"
-                    tvLog.text = "预览 ${prepared.previewBitmap.width}×${prepared.previewBitmap.height} 点，" +
+                    tvPdfStatus.text = "已选文件: ${uri.lastPathSegment}（$pdfSize）"
+                    tvLog.text = "点阵 ${prepared.previewBitmap.width}×${prepared.previewBitmap.height}，" +
                         when {
-                            prepared.scaledToPaper -> "已按纸张等比缩放"
+                            prepared.scaledToPaper -> "已按纸张等比缩放，整页一张纸"
                             clipped -> "实际打印前 ${prepared.heightDots / DOTS_PER_MM}mm，其余丢弃"
                             else -> "整页都在纸张内"
                         }
@@ -929,6 +941,9 @@ class MainActivity : AppCompatActivity() {
         //   缩放        —— 整页等比缩进纸张矩形，一张纸完整打出（Chrome 的「适合页面」）。
         val fitHeightDots = if (scaleToPaper) paperMm * DOTS_PER_MM else 0
         val bitmap = renderPdfToBitmap(uri, labelSize.widthDots, fitHeightDots)
+        // PDF 单位是 1/72 英寸，换算成毫米（渲染时顺手记下来的，用的是页面真实尺寸）
+        val pdfWidthMm = (lastPageWidthPt * 25.4f / 72f).roundToInt()
+        val pdfHeightMm = (lastPageHeightPt * 25.4f / 72f).roundToInt()
         FileOutputStream(File(cacheDir, "render-debug.png")).use {
             bitmap.compress(Bitmap.CompressFormat.PNG, 100, it)
         }
@@ -946,6 +961,10 @@ class MainActivity : AppCompatActivity() {
             "点阵 ${bitmap.width}×${bitmap.height} 点（$mode），纸内最后一条有墨迹的行 = $lastInk" +
                 "（约 ${(lastInk + 1) / DOTS_PER_MM}mm）"
         )
+        Log.i(
+            "BtPrint",
+            "PDF 页面 ${pdfWidthMm}×${pdfHeightMm} mm，纸张 ${labelSize.widthMm}×${labelSize.heightMm} mm"
+        )
         var preview = createPreviewFromTspl(bitmapData, bitmap.width, bitmap.height, widthInBytes)
         if (printRows < bitmap.height) preview = markPaperEdge(preview, printRows)
         // 留一份预览图，方便排查"预览和实际打出来不一致"这类问题
@@ -956,7 +975,8 @@ class MainActivity : AppCompatActivity() {
         }
         bitmap.recycle()
         return PreparedPrintData(
-            uri, labelSize, bitmapData, widthInBytes, printRows, preview, scaleToPaper
+            uri, labelSize, bitmapData, widthInBytes, printRows, preview, scaleToPaper,
+            pdfWidthMm, pdfHeightMm
         )
     }
 
@@ -1037,6 +1057,8 @@ class MainActivity : AppCompatActivity() {
                 val bounds = page.bounds
                 val pageWidth = (bounds.x1 - bounds.x0).coerceAtLeast(1f)
                 val pageHeight = (bounds.y1 - bounds.y0).coerceAtLeast(1f)
+                lastPageWidthPt = pageWidth
+                lastPageHeightPt = pageHeight
                 // 缩放模式：等比缩进纸张矩形；否则页面比纸宽才缩，保持 203dpi 原尺寸（1mm = 8 点）
                 val scale = if (fitHeightDots > 0) {
                     minOf(maxWidthDots / pageWidth, fitHeightDots / pageHeight)
@@ -1115,6 +1137,8 @@ class MainActivity : AppCompatActivity() {
                 renderer.openPage(0).use { page ->
                     val pageWidth = page.width.coerceAtLeast(1)
                     val pageHeight = page.height.coerceAtLeast(1)
+                    lastPageWidthPt = pageWidth.toFloat()
+                    lastPageHeightPt = pageHeight.toFloat()
                     val scale = if (fitHeightDots > 0) {
                         minOf(maxWidthDots.toFloat() / pageWidth, fitHeightDots.toFloat() / pageHeight)
                     } else {
