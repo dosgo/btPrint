@@ -23,6 +23,22 @@
         android:layout_marginTop="8dp" />
 
     <TextView
+        android:id="@+id/tvBtState"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:textColor="#666666"
+        android:textSize="12sp"
+        android:text="等待蓝牙权限…" />
+
+    <Button
+        android:id="@+id/btnRefreshDevices"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="刷新 / 搜索蓝牙设备" />
+
+    <TextView
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginTop="20dp"
@@ -34,6 +50,35 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="8dp" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="实际纸张长度" />
+
+        <EditText
+            android:id="@+id/etPaperLength"
+            android:layout_width="72dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:importantForAutofill="no"
+            android:inputType="number"
+            android:text="100" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="6dp"
+            android:text="mm（内容比纸长时，按此长度分页对齐）"
+            android:textSize="12sp" />
+    </LinearLayout>
 
     <Button
         android:id="@+id/btnSelectPdf"
@@ -75,6 +120,13 @@
         android:layout_height="wrap_content"
         android:layout_marginTop="32dp"
         android:text="4. 开始高清打印" />
+
+    <Button
+        android:id="@+id/btnTestPrint"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="发送测试页（不依赖 PDF，排查用）" />
 
     <TextView
         android:id="@+id/tvLog"
