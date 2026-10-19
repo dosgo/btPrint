@@ -35,6 +35,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.dosgo.btPrint.bluetooth.PrintJobLock
 import com.dosgo.btPrint.bluetooth.PrinterConnector
+import com.dosgo.btPrint.bluetooth.PrinterFilter
 import com.dosgo.btPrint.bluetooth.PrinterTransport
 import java.io.File
 import java.io.FileOutputStream
@@ -52,6 +53,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var ivPrintPreview: ImageView
     private lateinit var tvBtState: TextView
     private lateinit var etPaperLength: EditText
+    private lateinit var etCopies: EditText
     private lateinit var btnSelectPdf: Button
     private lateinit var btnPrint: Button
     private lateinit var btnTestPrint: Button
@@ -74,7 +76,7 @@ class MainActivity : AppCompatActivity() {
         get() = (getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
 
     private val deviceList: List<BluetoothDevice>
-        get() = foundDevices.values.toList()
+        get() = foundDevices.values.filterNot { PrinterFilter.isDefinitelyNotPrinter(it) }
 
     // adb 调试入口：绕过界面直接给指定 MAC 发指令
     // adb shell am start -n com.dosgo.btPrint/.MainActivity --es test_mac "3B:B3:19:04:3F:C0" --es test_cmd "..."
@@ -159,6 +161,7 @@ class MainActivity : AppCompatActivity() {
         ivPrintPreview = findViewById(R.id.ivPrintPreview)
         tvBtState = findViewById(R.id.tvBtState)
         etPaperLength = findViewById(R.id.etPaperLength)
+        etCopies = findViewById(R.id.etCopies)
 
         spinnerLabelSize.adapter = ArrayAdapter(
             this,
@@ -313,6 +316,17 @@ class MainActivity : AppCompatActivity() {
     private fun paperLengthMm(): Int =
         etPaperLength.text?.toString()?.trim()?.toIntOrNull()
             ?.coerceIn(20, MAX_SEGMENT_HEIGHT_MM) ?: DEFAULT_PAPER_LENGTH_MM
+
+    /** 打印份数：空/非法按 1 份，上限 50 份（防手滑打出一长串）。 */
+    private fun copyCount(): Int {
+        val raw = etCopies.text?.toString()?.trim().orEmpty()
+        val n = raw.toIntOrNull()?.coerceIn(1, MAX_COPIES) ?: 1
+        // 把纠正后的值写回输入框，避免"填了 999 实际只打 50 份"这种困惑
+        if (raw != n.toString()) {
+            runOnUiThread { etCopies.setText(n.toString()) }
+        }
+        return n
+    }
 
     private fun preparePreview(uri: Uri, labelSize: LabelSize) {
         thread {
@@ -492,7 +506,12 @@ class MainActivity : AppCompatActivity() {
         runCatching {
             adapter.bondedDevices?.forEach { foundDevices[it.address] = it }
         }
-        Log.i("BtPrint", "已配对设备 ${foundDevices.size} 个: ${foundDevices.values.joinToString { "${safeDeviceName(it)}(${it.address})" }}")
+        Log.i("BtPrint", "已配对设备 ${foundDevices.size} 个: ${foundDevices.values.joinToString { "${safeDeviceName(it)}(${it.address} cod=0x${Integer.toHexString(deviceCod(it))})" }}")
+        Log.i(
+            "BtPrint",
+            "过滤后列表 ${deviceList.size} 台：" +
+                deviceList.joinToString { "${safeDeviceName(it)}(${it.address})" }
+        )
         updateDeviceSpinner()
         registerDiscoveryReceiver()
         startDiscovery(adapter)
@@ -527,7 +546,8 @@ class MainActivity : AppCompatActivity() {
                         updateDeviceSpinner()
                     }
                     BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
-                        tvBtState.text = "搜索结束，共发现 ${foundDevices.size} 个设备"
+                        tvBtState.text =
+                            "搜索结束，列表 ${deviceList.size} 台（共发现 ${foundDevices.size} 台蓝牙设备）"
                     }
                 }
             }
@@ -541,24 +561,31 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateDeviceSpinner() {
+        val devices = deviceList
         val previousAddress = spinnerDevices.selectedItemPosition
             .takeIf { it >= 0 }
-            ?.let { deviceList.getOrNull(it)?.address }
+            ?.let { devices.getOrNull(it)?.address }
 
-        val names = deviceList.map { dev ->
-            val kind = when {
-                Build.VERSION.SDK_INT < Build.VERSION_CODES.JELLY_BEAN_MR2 -> ""
-                dev.type == BluetoothDevice.DEVICE_TYPE_LE -> " [LE]"
-                dev.type == BluetoothDevice.DEVICE_TYPE_DUAL -> " [双模]"
-                dev.type == BluetoothDevice.DEVICE_TYPE_CLASSIC -> " [经典]"
-                else -> ""
+        val names = if (devices.isEmpty()) {
+            // 空列表时给一行提示，否则下拉框是空白的，用户会以为扫描坏了
+            listOf("未发现蓝牙设备，点上方按钮重新搜索")
+        } else {
+            devices.map { dev ->
+                val kind = when {
+                    Build.VERSION.SDK_INT < Build.VERSION_CODES.JELLY_BEAN_MR2 -> ""
+                    dev.type == BluetoothDevice.DEVICE_TYPE_LE -> " [LE]"
+                    dev.type == BluetoothDevice.DEVICE_TYPE_DUAL -> " [双模]"
+                    dev.type == BluetoothDevice.DEVICE_TYPE_CLASSIC -> " [经典]"
+                    else -> ""
+                }
+                "${safeDeviceName(dev)} (${dev.address})$kind"
             }
-            "${safeDeviceName(dev)} (${dev.address})$kind"
         }
 
-        spinnerDevices.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, names)
+        spinnerDevices.adapter =
+            ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, names)
         previousAddress?.let { addr ->
-            deviceList.indexOfFirst { it.address == addr }
+            devices.indexOfFirst { it.address == addr }
                 .takeIf { it >= 0 }
                 ?.let { spinnerDevices.setSelection(it) }
         }
@@ -566,6 +593,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun safeDeviceName(dev: BluetoothDevice): String =
         runCatching { dev.name }.getOrNull() ?: "未知设备"
+
+    /** Class of Device，打印出来方便判断一台设备为什么被过滤掉 */
+    private fun deviceCod(dev: BluetoothDevice): Int =
+        runCatching { dev.bluetoothClass?.deviceClass ?: -1 }.getOrDefault(-1)
 
     // ---- 打印锁 ----
 
@@ -609,6 +640,7 @@ class MainActivity : AppCompatActivity() {
         spinnerDevices.isEnabled = !busy
         spinnerLabelSize.isEnabled = !busy
         etPaperLength.isEnabled = !busy
+        etCopies.isEnabled = !busy
         btnPrint.text = if (busy) "打印中…（请等待）" else "4. 开始高清打印"
     }
 
@@ -650,18 +682,30 @@ class MainActivity : AppCompatActivity() {
                         "下发 BITMAP ${prepared.widthInBytes} 字节/行 × ${prepared.heightDots} 行，" +
                             "点阵共 ${prepared.bitmapData.size} 字节，通道=${transport.kind}"
                     )
-                    val pages = sendToPrinter(
-                        transport,
-                        prepared.bitmapData,
-                        prepared.widthInBytes,
-                        prepared.heightDots,
-                        labelSize,
-                        paperMm = paperLengthMm()
-                    )
-                    if (pages > 1) {
-                        "打印完成！共 $pages 张纸，每张都从纸头起打（${transport.kind}，${prepared.bitmapData.size} 字节）"
-                    } else {
-                        "打印完成！（${transport.kind}，${prepared.bitmapData.size} 字节）"
+                    val copies = copyCount()
+                    var pagesPerCopy = 0
+                    for (copy in 1..copies) {
+                        if (copies > 1) {
+                            Log.i("BtPrint", "开始第 $copy/$copies 份")
+                            runOnUiThread { tvLog.text = "正在打印第 $copy/$copies 份…" }
+                        }
+                        pagesPerCopy = sendToPrinter(
+                            transport,
+                            prepared.bitmapData,
+                            prepared.widthInBytes,
+                            prepared.heightDots,
+                            labelSize,
+                            paperMm = paperLengthMm()
+                        )
+                    }
+                    val totalSheets = pagesPerCopy * copies
+                    when {
+                        copies > 1 ->
+                            "打印完成！$copies 份，共 $totalSheets 张纸（${transport.kind}，${prepared.bitmapData.size} 字节/份）"
+                        pagesPerCopy > 1 ->
+                            "打印完成！共 $pagesPerCopy 张纸，每张都从纸头起打（${transport.kind}，${prepared.bitmapData.size} 字节）"
+                        else ->
+                            "打印完成！（${transport.kind}，${prepared.bitmapData.size} 字节）"
                     }
                 }
             } catch (e: Exception) {
@@ -1207,5 +1251,7 @@ class MainActivity : AppCompatActivity() {
         // 探活用。TSPL 里空行是空操作，不会出纸、不影响画布，
         // 但足以把一个"对面已断"的 socket 的 EPIPE 提前暴露出来。
         private val PROBE_LINE = "\r\n".toByteArray(Charsets.US_ASCII)
+
+        private const val MAX_COPIES = 50
     }
 }
