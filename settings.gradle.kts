@@ -16,6 +16,8 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // MuPDF 只在 Artifex 自己的仓库发布
+        maven { url = uri("https://maven.ghostscript.com") }
     }
 }
 

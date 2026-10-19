@@ -26,6 +26,11 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // MuPDF 自带 4 个 ABI 的 so（共约 39MB），这台机器是 arm64，只打这一个
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
     }
 
     buildTypes {
@@ -47,7 +52,9 @@ android {
 }
 
 dependencies {
-    implementation("io.legere:pdfiumandroid:2.0.3")
+    // MuPDF：字体回退完整的渲染引擎（WPS 同类），用于面单这类不嵌字体的 PDF。
+    // Artifex 官方仓到本机只有 19KB/s，AAR 已放到 app/libs 本地引用，避免每次联网拉 21MB。
+    implementation(files("libs/fitz-1.28.5.aar"))
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)
