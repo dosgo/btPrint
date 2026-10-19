@@ -50,6 +50,15 @@ class MainActivity : AppCompatActivity() {
     private lateinit var ivPrintPreview: ImageView
     private lateinit var tvBtState: TextView
     private lateinit var etPaperLength: EditText
+    private lateinit var btnSelectPdf: Button
+    private lateinit var btnPrint: Button
+    private lateinit var btnTestPrint: Button
+    private lateinit var btnRefreshDevices: Button
+
+    // 打印锁：整条链路（渲染 → 连接 → 分幅下发 → 走纸）是串行的，
+    // 重复点击会让第二份指令插进蓝牙栈，打印机要么丢数据要么锁死。
+    @Volatile
+    private var isPrinting = false
 
     private var selectedPdfUri: Uri? = null
     private var preparedPrintData: PreparedPrintData? = null
@@ -152,9 +161,13 @@ class MainActivity : AppCompatActivity() {
             android.R.layout.simple_spinner_dropdown_item,
             labelSizes
         )
-        // 默认选 100×99：实际用纸是 100×100 间隙纸，这个规格一张纸打完不浪费
-        spinnerLabelSize.setSelection(labelSizes.indexOfFirst { it.widthMm == 100 && it.heightMm == 99 }
-            .coerceAtLeast(0))
+        // 默认 100×150：面单是 4×6（108×153mm）的竖长比例，按满宽 100mm 打，
+        // 会按纸长自动分成 99mm + 51mm 两张纸，内容占满纸宽、字最大。
+        // 若只想用一张纸，手动选「100 × 99」即可，但内容会被等比压到约 70mm 宽，字更小。
+        spinnerLabelSize.setSelection(
+            labelSizes.indexOfFirst { it.widthMm == 100 && it.heightMm == 150 }
+                .coerceAtLeast(0)
+        )
         spinnerLabelSize.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
                 val uri = selectedPdfUri ?: return
