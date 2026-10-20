@@ -9,7 +9,6 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothSocket
 import android.content.Context
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -39,6 +38,12 @@ interface PrinterTransport {
 
     @Throws(IOException::class)
     fun write(data: ByteArray)
+
+    /** 发送原数组中的一段，避免大点阵分带时反复复制 ByteArray。 */
+    @Throws(IOException::class)
+    fun write(data: ByteArray, offset: Int, length: Int) {
+        write(data.copyOfRange(offset, offset + length))
+    }
 
     fun close()
 }
@@ -105,14 +110,12 @@ object PrinterConnector {
         synchronized(cacheLock) { closeCachedLocked("空闲超过 ${IDLE_KEEP_MS}ms") }
     }
 
-    /** 当前是否已有连接（含正在建立中的）。 */
-    fun hasConnection(): Boolean = exclusiveSlot.get() != null
-
     /** 当前占用的通道描述；无连接返回 null。 */
     fun activeKind(): String? =
         exclusiveSlot.get()?.takeIf { it !== ConnectingToken }?.kind
 
     /** 连接前必须停止搜索，否则 RFCOMM 握手会被拖慢甚至直接超时。 */
+    @SuppressLint("MissingPermission")
     fun cancelDiscovery() {
         runCatching { BluetoothAdapter.getDefaultAdapter()?.cancelDiscovery() }
             .onFailure { Log.w(TAG, "cancelDiscovery 失败", it) }
@@ -327,6 +330,11 @@ object PrinterConnector {
             inner.write(data)
         }
 
+        override fun write(data: ByteArray, offset: Int, length: Int) {
+            if (closed.get()) throw IOException("通道已关闭")
+            inner.write(data, offset, length)
+        }
+
         override fun close() {
             if (!closed.compareAndSet(false, true)) return
             exclusiveSlot.compareAndSet(this, null)
@@ -348,21 +356,27 @@ object PrinterConnector {
 
         override val bytesSent: Long get() = sent
 
-        override fun write(data: ByteArray) {
+        override fun write(data: ByteArray) = write(data, 0, data.size)
+
+        override fun write(data: ByteArray, offset: Int, length: Int) {
+            require(offset >= 0 && length >= 0 && offset <= data.size - length) {
+                "无效数据范围 offset=$offset length=$length size=${data.size}"
+            }
             val out = socket.outputStream
             // 两道约束：
             // 1) RFCOMM 实测 MTU 约 990，取 512 留余量，超限会被拆包导致数据错乱；
             // 2) 大点阵必须节流 —— 打印机 MCU 来不及消化全速灌入的字节会静默丢包，
             //    表现为小图能打、大图毫无反应。
-            val needThrottle = throttleMs > 0 && data.size > THROTTLE_THRESHOLD
-            var offset = 0
-            while (offset < data.size) {
-                val len = minOf(CHUNK_SIZE, data.size - offset)
-                out.write(data, offset, len)
+            val needThrottle = throttleMs > 0 && length > THROTTLE_THRESHOLD
+            val end = offset + length
+            var cursor = offset
+            while (cursor < end) {
+                val len = minOf(CHUNK_SIZE, end - cursor)
+                out.write(data, cursor, len)
                 out.flush()
-                offset += len
+                cursor += len
                 sent += len
-                if (needThrottle && offset < data.size) Thread.sleep(throttleMs.toLong())
+                if (needThrottle && cursor < end) Thread.sleep(throttleMs.toLong())
             }
         }
 
@@ -434,9 +448,7 @@ object PrinterConnector {
                     writeChar = ch
                     connected.countDown()
                     // 抬 MTU 减少分包；回调不一定来，超时后按默认值继续
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                        runCatching { g.requestMtu(517) }
-                    }
+                    runCatching { g.requestMtu(517) }
                     Handler(Looper.getMainLooper()).postDelayed({ servicesReady.countDown() }, 1200)
                 }
 
@@ -455,11 +467,7 @@ object PrinterConnector {
                 }
             }
 
-            gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
-            } else {
-                device.connectGatt(context, false, callback)
-            }
+            gatt = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
             val g = gatt ?: throw IOException("connectGatt 返回 null")
 
             if (!connected.await(12, TimeUnit.SECONDS)) {

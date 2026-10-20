@@ -1,5 +1,6 @@
 package com.dosgo.btPrint.bluetooth
 
+import android.annotation.SuppressLint
 import android.bluetooth.BluetoothClass
 import android.bluetooth.BluetoothDevice
 
@@ -36,6 +37,7 @@ object PrinterFilter {
         "手环", "手表", "耳机", "音箱", "键盘", "鼠标", "平板", "手机"
     )
 
+    @SuppressLint("MissingPermission")
     fun isDefinitelyNotPrinter(device: BluetoothDevice): Boolean {
         val major = runCatching { device.bluetoothClass?.majorDeviceClass }.getOrNull()
         if (major != null && major in NOT_PRINTER_MAJORS) return true
