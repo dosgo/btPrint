@@ -36,6 +36,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import com.dosgo.btPrint.bluetooth.PrintJobLock
 import com.dosgo.btPrint.bluetooth.PrinterConnector
 import com.dosgo.btPrint.bluetooth.PrinterFilter
@@ -51,6 +53,10 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var spinnerDevices: Spinner
     private lateinit var spinnerLabelSize: Spinner
+    private lateinit var spinnerDpi: Spinner
+    private lateinit var spinnerSpeed: Spinner
+    private lateinit var spinnerDensity: Spinner
+    private lateinit var spinnerMediaType: Spinner
     private lateinit var tvPdfStatus: TextView
     private lateinit var tvLog: TextView
     private lateinit var tvPreviewLabel: TextView
@@ -63,6 +69,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnTestPrint: Button
     private lateinit var btnRefreshDevices: Button
     private lateinit var deviceAdapter: ArrayAdapter<String>
+    private var loadingPrintSettings = false
 
     // 打印锁：整条链路（渲染 → 连接 → 分幅下发 → 走纸）是串行的，
     // 重复点击会让第二份指令插进蓝牙栈，打印机要么丢数据要么锁死。
@@ -115,9 +122,26 @@ class MainActivity : AppCompatActivity() {
     private var pendingScale = false
 
     private data class LabelSize(val widthMm: Int, val heightMm: Int) {
-        val widthDots: Int get() = widthMm * DOTS_PER_MM
-        val heightDots: Int get() = heightMm * DOTS_PER_MM
-        override fun toString() = "${widthMm} × ${heightMm} mm　${widthDots} × ${heightDots} 点"
+        override fun toString() = "${widthMm} × ${heightMm} mm"
+    }
+
+    private data class PrintSettings(
+        val dpi: Int = DEFAULT_DPI,
+        val speed: Int = DEFAULT_SPEED,
+        val density: Int = DEFAULT_DENSITY,
+        val mediaType: MediaType = MediaType.GAP
+    )
+
+    private enum class MediaType(val displayName: String) {
+        GAP("间隙纸"),
+        BLACK_MARK("黑标纸"),
+        CONTINUOUS("连续纸");
+
+        fun tsplCommand(): String = when (this) {
+            GAP -> "GAP $DEFAULT_GAP_MM mm, 0 mm"
+            BLACK_MARK -> "BLINE $DEFAULT_BLACK_MARK_MM mm, 0 mm"
+            CONTINUOUS -> "GAP 0 mm, 0 mm"
+        }
     }
 
     // 这里列的是**实际纸张规格**：预览不看它，打印时按它截断（宽取它、高取它）。
@@ -131,6 +155,10 @@ class MainActivity : AppCompatActivity() {
         LabelSize(60, 40),
         LabelSize(50, 30)    // 已实测能正常出纸的规格
     )
+    private val dpiOptions = listOf(203, 300)
+    private val speedOptions = listOf(3, 4, 5, 6)
+    private val densityOptions = (4..12).toList()
+    private val mediaTypeOptions = MediaType.entries
 
     private data class PreparedPrintData(
         val sourceUri: Uri,
@@ -139,6 +167,7 @@ class MainActivity : AppCompatActivity() {
         val widthInBytes: Int,
         val heightDots: Int,
         val previewBitmap: Bitmap,
+        val dpi: Int,
         // 是否是「缩放到纸张」模式（同规格下两种模式的点阵不同，缓存要区分）
         val scaledToPaper: Boolean = false,
         // PDF 页面原始尺寸（mm），显示用
@@ -168,8 +197,20 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        // Android 15+ 默认使用边到边布局：主动留出状态栏和底部导航栏，
+        // 避免页面首尾内容被系统栏覆盖。
+        ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.mainScrollView)) { view, insets ->
+            val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.setPadding(systemBars.left, systemBars.top, systemBars.right, systemBars.bottom)
+            insets
+        }
+
         spinnerDevices = findViewById(R.id.spinnerDevices)
         spinnerLabelSize = findViewById(R.id.spinnerLabelSize)
+        spinnerDpi = findViewById(R.id.spinnerDpi)
+        spinnerSpeed = findViewById(R.id.spinnerSpeed)
+        spinnerDensity = findViewById(R.id.spinnerDensity)
+        spinnerMediaType = findViewById(R.id.spinnerMediaType)
         tvPdfStatus = findViewById(R.id.tvPdfStatus)
         tvLog = findViewById(R.id.tvLog)
         tvPreviewLabel = findViewById(R.id.tvPreviewLabel)
@@ -183,6 +224,36 @@ class MainActivity : AppCompatActivity() {
             mutableListOf<String>()
         )
         spinnerDevices.adapter = deviceAdapter
+
+        spinnerDpi.adapter = ArrayAdapter(
+            this, android.R.layout.simple_spinner_dropdown_item,
+            dpiOptions.map { "$it DPI" }
+        )
+        spinnerSpeed.adapter = ArrayAdapter(
+            this, android.R.layout.simple_spinner_dropdown_item,
+            speedOptions.map { it.toString() }
+        )
+        spinnerDensity.adapter = ArrayAdapter(
+            this, android.R.layout.simple_spinner_dropdown_item,
+            densityOptions.map { it.toString() }
+        )
+        spinnerMediaType.adapter = ArrayAdapter(
+            this, android.R.layout.simple_spinner_dropdown_item,
+            mediaTypeOptions.map { it.displayName }
+        )
+        setPrintSettingsSelections(PrintSettings())
+
+        spinnerDevices.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                loadPrintSettingsForSelectedDevice()
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
+        spinnerDpi.onItemSelectedListener = printSettingListener(rerenderPreview = true)
+        spinnerSpeed.onItemSelectedListener = printSettingListener(rerenderPreview = false)
+        spinnerDensity.onItemSelectedListener = printSettingListener(rerenderPreview = false)
+        spinnerMediaType.onItemSelectedListener = printSettingListener(rerenderPreview = false)
 
         spinnerLabelSize.adapter = ArrayAdapter(
             this,
@@ -339,6 +410,73 @@ class MainActivity : AppCompatActivity() {
     private fun selectedLabelSize(): LabelSize =
         labelSizes.getOrElse(spinnerLabelSize.selectedItemPosition) { labelSizes.first() }
 
+    private fun selectedPrintSettings(): PrintSettings = PrintSettings(
+        dpi = dpiOptions.getOrElse(spinnerDpi.selectedItemPosition) { DEFAULT_DPI },
+        speed = speedOptions.getOrElse(spinnerSpeed.selectedItemPosition) { DEFAULT_SPEED },
+        density = densityOptions.getOrElse(spinnerDensity.selectedItemPosition) { DEFAULT_DENSITY },
+        mediaType = mediaTypeOptions.getOrElse(spinnerMediaType.selectedItemPosition) { MediaType.GAP }
+    )
+
+    private fun setPrintSettingsSelections(settings: PrintSettings) {
+        loadingPrintSettings = true
+        spinnerDpi.setSelection(dpiOptions.indexOf(settings.dpi).coerceAtLeast(0))
+        spinnerSpeed.setSelection(speedOptions.indexOf(settings.speed).coerceAtLeast(0))
+        spinnerDensity.setSelection(densityOptions.indexOf(settings.density).coerceAtLeast(0))
+        spinnerMediaType.setSelection(mediaTypeOptions.indexOf(settings.mediaType).coerceAtLeast(0))
+        // Spinner 的选择回调可能延迟到下一帧；届时再解除保护，避免载入值被当成用户修改。
+        spinnerMediaType.post { loadingPrintSettings = false }
+    }
+
+    private fun selectedPrinterSettingsKey(): String =
+        deviceList.getOrNull(spinnerDevices.selectedItemPosition)?.address ?: "default"
+
+    private fun loadPrintSettingsForSelectedDevice() {
+        val key = selectedPrinterSettingsKey()
+        val prefs = getSharedPreferences(PRINT_SETTINGS_PREFS, Context.MODE_PRIVATE)
+        val previousDpi = selectedPrintSettings().dpi
+        val loaded = PrintSettings(
+            dpi = prefs.getInt("$key.dpi", DEFAULT_DPI),
+            speed = prefs.getInt("$key.speed", DEFAULT_SPEED),
+            density = prefs.getInt("$key.density", DEFAULT_DENSITY),
+            mediaType = mediaTypeOptions.getOrElse(
+                prefs.getInt("$key.mediaType", MediaType.GAP.ordinal)
+            ) { MediaType.GAP }
+        )
+        setPrintSettingsSelections(loaded)
+        if (previousDpi != loaded.dpi) selectedPdfUri?.let { uri ->
+            clearPreparedPreview("打印机参数已载入，正在重新生成预览...")
+            preparePreview(uri, selectedLabelSize())
+        }
+    }
+
+    private fun savePrintSettingsForSelectedDevice() {
+        val key = selectedPrinterSettingsKey()
+        val settings = selectedPrintSettings()
+        getSharedPreferences(PRINT_SETTINGS_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putInt("$key.dpi", settings.dpi)
+            .putInt("$key.speed", settings.speed)
+            .putInt("$key.density", settings.density)
+            .putInt("$key.mediaType", settings.mediaType.ordinal)
+            .apply()
+    }
+
+    private fun printSettingListener(rerenderPreview: Boolean) =
+        object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                if (loadingPrintSettings) return
+                savePrintSettingsForSelectedDevice()
+                if (rerenderPreview) {
+                    selectedPdfUri?.let { uri ->
+                        clearPreparedPreview("分辨率已改变，正在重新生成预览...")
+                        preparePreview(uri, selectedLabelSize())
+                    }
+                }
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
+
     /** 勾选后把整页等比缩进纸张（一张纸打完整页）；默认不勾，按纸张裁切。 */
     private fun scaleToPaper(): Boolean = cbScaleToPaper.isChecked
 
@@ -355,14 +493,18 @@ class MainActivity : AppCompatActivity() {
 
     private fun preparePreview(uri: Uri, labelSize: LabelSize) {
         val scaled = scaleToPaper()
+        val settings = selectedPrintSettings()
         val generation = previewGeneration.incrementAndGet()
         previewExecutor.execute {
             if (generation != previewGeneration.get()) return@execute
             try {
-                val prepared = preparePrintData(uri, labelSize, labelSize.heightMm, scaled)
+                val prepared = preparePrintData(
+                    uri, labelSize, labelSize.heightMm, scaled, settings.dpi
+                )
                 runOnUiThread {
                     if (generation != previewGeneration.get() || selectedPdfUri != uri ||
-                        selectedLabelSize() != labelSize || scaleToPaper() != scaled
+                        selectedLabelSize() != labelSize || scaleToPaper() != scaled ||
+                        selectedPrintSettings().dpi != settings.dpi
                     ) {
                         prepared.previewBitmap.recycle()
                         return@runOnUiThread
@@ -390,7 +532,7 @@ class MainActivity : AppCompatActivity() {
                     tvLog.text = "点阵 ${prepared.previewBitmap.width}×${prepared.previewBitmap.height}，" +
                         when {
                             prepared.scaledToPaper -> "已按纸张等比缩放，整页一张纸"
-                            clipped -> "实际打印前 ${prepared.heightDots / DOTS_PER_MM}mm，其余丢弃"
+                            clipped -> "实际打印前 ${prepared.heightDots / dotsPerMm(prepared.dpi)}mm，其余丢弃"
                             else -> "整页都在纸张内"
                         }
                 }
@@ -398,7 +540,8 @@ class MainActivity : AppCompatActivity() {
                 e.printStackTrace()
                 runOnUiThread {
                     if (generation != previewGeneration.get() || selectedPdfUri != uri ||
-                        selectedLabelSize() != labelSize || scaleToPaper() != scaled
+                        selectedLabelSize() != labelSize || scaleToPaper() != scaled ||
+                        selectedPrintSettings().dpi != settings.dpi
                     ) return@runOnUiThread
                     tvPdfStatus.text = "PDF 预览生成失败"
                     tvLog.text = "无法读取 PDF: ${e.message}"
@@ -486,7 +629,8 @@ class MainActivity : AppCompatActivity() {
                         Uri.fromFile(File(renderOnlyPdf)),
                         LabelSize(pendingPdfW, pendingPdfH),
                         pendingPaperMm,
-                        pendingScale
+                        pendingScale,
+                        DEFAULT_DPI
                     )
                     Log.i("BtPrint", "仅渲染完成：${prepared.bitmapData.size} 字节（未发送）")
                     runOnUiThread {
@@ -517,11 +661,14 @@ class MainActivity : AppCompatActivity() {
                         val file = File(pdfPath)
                         if (!file.exists()) return@connectAndRun "PDF 不存在：$pdfPath"
                         val size = LabelSize(pendingPdfW, pendingPdfH)
-                        val prepared = preparePrintData(Uri.fromFile(file), size, pendingPaperMm, pendingScale)
+                        val prepared = preparePrintData(
+                            Uri.fromFile(file), size, pendingPaperMm, pendingScale, DEFAULT_DPI
+                        )
                         val pages = sendToPrinter(
                             transport, prepared.bitmapData, prepared.widthInBytes,
                             prepared.heightDots, size, pendingSegmentMm, pendingBandDelayMs,
-                            pendingGapMm, pendingPaperMm, pendingBandBytes
+                            pendingGapMm, pendingPaperMm, pendingBandBytes, DEFAULT_DPI,
+                            DEFAULT_SPEED, DEFAULT_DENSITY
                         )
                         return@connectAndRun "PDF 打印完成，共 $pages 幅（${prepared.bitmapData.size} 字节）"
                     }
@@ -538,7 +685,7 @@ class MainActivity : AppCompatActivity() {
                         sendDebugBitmap(transport, bitmapMm.first, bitmapMm.second, pendingBandDelayMs)
                     } else {
                         val data = rawCmd?.let { (it.replace("\\n", "\r\n") + "\r\n").toByteArray(Charsets.US_ASCII) }
-                            ?: buildTestPageCommand()
+                            ?: buildTestPageCommand(DEFAULT_SPEED, DEFAULT_DENSITY)
                         Log.i(
                             "BtPrint",
                             "调试发送 ${data.size} 字节 via ${transport.kind}: ${asciiPreview(data, 300)}"
@@ -703,6 +850,10 @@ class MainActivity : AppCompatActivity() {
         btnSelectPdf.isEnabled = !busy
         spinnerDevices.isEnabled = !busy
         spinnerLabelSize.isEnabled = !busy
+        spinnerDpi.isEnabled = !busy
+        spinnerSpeed.isEnabled = !busy
+        spinnerDensity.isEnabled = !busy
+        spinnerMediaType.isEnabled = !busy
         cbScaleToPaper.isEnabled = !busy
         etCopies.isEnabled = !busy
         btnPrint.text = if (busy) "打印中…（请等待）" else "4. 开始高清打印"
@@ -732,6 +883,7 @@ class MainActivity : AppCompatActivity() {
         )
         val labelSize = selectedLabelSize()
         val scaled = scaleToPaper()
+        val settings = selectedPrintSettings()
         val copies = copyCount()
         tvLog.text = if (scaled) {
             "正在渲染（缩放到纸张 ${labelSize.widthMm}×${labelSize.heightMm}mm）..."
@@ -745,9 +897,11 @@ class MainActivity : AppCompatActivity() {
                 val prepared = preparedPrintData
                     ?.takeIf {
                         it.sourceUri == uri && it.labelSize == labelSize &&
-                            it.scaledToPaper == scaled
+                            it.scaledToPaper == scaled && it.dpi == settings.dpi
                     }
-                    ?: preparePrintData(uri, labelSize, labelSize.heightMm, scaled)
+                    ?: preparePrintData(
+                        uri, labelSize, labelSize.heightMm, scaled, settings.dpi
+                    )
 
                 connectAndRun(targetDevice) { transport ->
                     Log.i(
@@ -767,7 +921,11 @@ class MainActivity : AppCompatActivity() {
                             prepared.widthInBytes,
                             prepared.heightDots,
                             labelSize,
-                            paperMm = labelSize.heightMm
+                            paperMm = labelSize.heightMm,
+                            dpi = settings.dpi,
+                            speed = settings.speed,
+                            density = settings.density,
+                            mediaType = settings.mediaType
                         )
                     }
                     val totalSheets = pagesPerCopy * copies
@@ -793,6 +951,7 @@ class MainActivity : AppCompatActivity() {
     /** 不依赖 PDF 的最小测试页。能打出来说明通道和指令都对，问题在点阵数据本身。 */
     private fun startTestPrint() {
         if (!acquirePrintLock("发送测试页")) return
+        val settings = selectedPrintSettings()
         val targetDevice = deviceList.getOrNull(spinnerDevices.selectedItemPosition)
         if (targetDevice == null) {
             tvLog.text = "请先选择一个蓝牙打印机（点上方刷新重新搜索）"
@@ -806,7 +965,9 @@ class MainActivity : AppCompatActivity() {
         thread {
             try {
                 connectAndRun(targetDevice) { transport ->
-                    val cmd = buildTestPageCommand()
+                    val cmd = buildTestPageCommand(
+                        settings.speed, settings.density, settings.mediaType
+                    )
                     Log.i("BtPrint", "测试页 ${cmd.size} 字节，通道=${transport.kind}")
                     transport.write(cmd)
                     Thread.sleep(1500)
@@ -879,16 +1040,20 @@ class MainActivity : AppCompatActivity() {
             ?: IOException("重试 $SEND_ATTEMPTS 次仍未发出数据，打印机可能已关机或不在范围")
     }
 
-    private fun buildTestPageCommand(): ByteArray {
+    private fun buildTestPageCommand(
+        speed: Int,
+        density: Int,
+        mediaType: MediaType = MediaType.GAP
+    ): ByteArray {
         val widthMm = 100
         val heightMm = 60
         val sb = StringBuilder()
         sb.append("SIZE $widthMm mm, $heightMm mm\r\n")
-        sb.append("GAP 2 mm, 0 mm\r\n")
+        sb.append("${mediaType.tsplCommand()}\r\n")
         sb.append("CLS\r\n")
         // 显式设定打印参数，避免沿用上一次会话的浓度/速度导致出纸异常
-        sb.append("DENSITY 8\r\n")
-        sb.append("SPEED 4\r\n")
+        sb.append("DENSITY $density\r\n")
+        sb.append("SPEED $speed\r\n")
         sb.append("DIRECTION 0\r\n")
         sb.append("TEXT 60,60,\"3\",0,1,1,\"BT PRINT OK\"\r\n")
         sb.append("BAR 60,220,700,8\r\n")
@@ -917,8 +1082,9 @@ class MainActivity : AppCompatActivity() {
         heightMm: Int,
         bandDelayMs: Long
     ): String {
-        val wDots = widthMm * DOTS_PER_MM
-        val hDots = heightMm * DOTS_PER_MM
+        val dotScale = dotsPerMm(DEFAULT_DPI)
+        val wDots = widthMm * dotScale
+        val hDots = heightMm * dotScale
         val bitmap = Bitmap.createBitmap(wDots, hDots, Bitmap.Config.ARGB_8888)
         bitmap.eraseColor(Color.WHITE)
         val canvas = Canvas(bitmap)
@@ -965,13 +1131,17 @@ class MainActivity : AppCompatActivity() {
         uri: Uri,
         labelSize: LabelSize,
         paperMm: Int = labelSize.heightMm,
-        scaleToPaper: Boolean = false
+        scaleToPaper: Boolean = false,
+        dpi: Int
     ): PreparedPrintData {
         // 两种模式：
         //   裁切（默认）—— 预览 = PDF 整页，实际只下发纸张装得下的那几行，超出部分丢掉；
         //   缩放        —— 整页等比缩进纸张矩形，一张纸完整打出（Chrome 的「适合页面」）。
-        val fitHeightDots = if (scaleToPaper) paperMm * DOTS_PER_MM else 0
-        val rendered = renderPdfToBitmap(uri, labelSize.widthDots, fitHeightDots)
+        val dotScale = dotsPerMm(dpi)
+        val fitHeightDots = if (scaleToPaper) paperMm * dotScale else 0
+        val rendered = renderPdfToBitmap(
+            uri, labelSize.widthMm * dotScale, fitHeightDots, dpi
+        )
         val bitmap = rendered.bitmap
         // PDF 单位是 1/72 英寸，换算成毫米（渲染时顺手记下来的，用的是页面真实尺寸）
         val pdfWidthMm = (rendered.widthPt * 25.4f / 72f).roundToInt()
@@ -980,21 +1150,21 @@ class MainActivity : AppCompatActivity() {
         val bitmapData = encoded.data
         val widthInBytes = encoded.widthInBytes
         // 实际打印多少行 = 纸张规格的长度（选了 150 的纸就是 150mm）
-        val printRows = (paperMm * DOTS_PER_MM).coerceIn(1, bitmap.height)
+        val printRows = (paperMm * dotScale).coerceIn(1, bitmap.height)
         val lastInk = if (encoded.lastInkRow < printRows) {
             encoded.lastInkRow
         } else {
             lastInkRowOf(bitmapData, widthInBytes, printRows)
         }
         val mode = when {
-            scaleToPaper -> "缩放到纸张 ${bitmap.width / DOTS_PER_MM}×${bitmap.height / DOTS_PER_MM}mm"
-            printRows < bitmap.height -> "纸张 ${printRows / DOTS_PER_MM}mm，超出部分丢弃"
-            else -> "整页 ${bitmap.height / DOTS_PER_MM}mm"
+            scaleToPaper -> "缩放到纸张 ${bitmap.width / dotScale}×${bitmap.height / dotScale}mm"
+            printRows < bitmap.height -> "纸张 ${printRows / dotScale}mm，超出部分丢弃"
+            else -> "整页 ${bitmap.height / dotScale}mm"
         }
         Log.i(
             "BtPrint",
             "点阵 ${bitmap.width}×${bitmap.height} 点（$mode），纸内最后一条有墨迹的行 = $lastInk" +
-                "（约 ${(lastInk + 1) / DOTS_PER_MM}mm）"
+                "（约 ${(lastInk + 1) / dotScale}mm）"
         )
         Log.i(
             "BtPrint",
@@ -1004,7 +1174,7 @@ class MainActivity : AppCompatActivity() {
         if (printRows < bitmap.height) preview = markPaperEdge(preview, printRows)
         bitmap.recycle()
         return PreparedPrintData(
-            uri, labelSize, bitmapData, widthInBytes, printRows, preview, scaleToPaper,
+            uri, labelSize, bitmapData, widthInBytes, printRows, preview, dpi, scaleToPaper,
             pdfWidthMm, pdfHeightMm
         )
     }
@@ -1054,25 +1224,35 @@ class MainActivity : AppCompatActivity() {
     // 不补白、不居中、不裁剪。这样屏幕预览看到的就是整张面单；纸张装不下的部分由
     // preparePrintData 在下发前按纸张规格截掉。
     // fitHeightDots > 0 时进入「缩放到纸张」模式：整页等比缩进 maxWidth × fitHeight 的矩形并居中。
-    private fun renderPdfToBitmap(uri: Uri, maxWidthDots: Int, fitHeightDots: Int = 0): RenderedPage {
+    private fun renderPdfToBitmap(
+        uri: Uri,
+        maxWidthDots: Int,
+        fitHeightDots: Int = 0,
+        dpi: Int = DEFAULT_DPI
+    ): RenderedPage {
         when (pendingRenderEngine) {
             "system" -> return runCatching {
-                renderWithSystemRenderer(uri, maxWidthDots, fitHeightDots)
+                renderWithSystemRenderer(uri, maxWidthDots, fitHeightDots, dpi)
             }.getOrElse { error ->
                 Log.w("BtPrintRenderer", "系统渲染失败，回退 MuPDF：${error.message}")
-                renderWithMuPdf(uri, maxWidthDots, fitHeightDots)
+                renderWithMuPdf(uri, maxWidthDots, fitHeightDots, dpi)
             }
         }
-        return runCatching { renderWithMuPdf(uri, maxWidthDots, fitHeightDots) }
+        return runCatching { renderWithMuPdf(uri, maxWidthDots, fitHeightDots, dpi) }
             .getOrElse { error ->
                 Log.w("BtPrintRenderer", "MuPDF 渲染失败，回退系统渲染器：${error.message}")
-                renderWithSystemRenderer(uri, maxWidthDots, fitHeightDots)
+                renderWithSystemRenderer(uri, maxWidthDots, fitHeightDots, dpi)
             }
     }
 
     // MuPDF（WPS 同类引擎）。它内置 CJK 字体回退，遇到只写字体名不嵌字体的
     // 中文文本时能按 PDF 声明的字宽排版，不会出现缺字形或英文挤在一起的问题。
-    private fun renderWithMuPdf(uri: Uri, maxWidthDots: Int, fitHeightDots: Int = 0): RenderedPage {
+    private fun renderWithMuPdf(
+        uri: Uri,
+        maxWidthDots: Int,
+        fitHeightDots: Int = 0,
+        dpi: Int = DEFAULT_DPI
+    ): RenderedPage {
         val source = File(cacheDir, "mupdf-render-source.pdf")
         contentResolver.openInputStream(uri)?.use { input ->
             source.outputStream().use { input.copyTo(it) }
@@ -1090,7 +1270,7 @@ class MainActivity : AppCompatActivity() {
                 val scale = if (fitHeightDots > 0) {
                     minOf(maxWidthDots / pageWidth, fitHeightDots / pageHeight)
                 } else {
-                    minOf(maxWidthDots / pageWidth, DOTS_PER_POINT)
+                    minOf(maxWidthDots / pageWidth, dotsPerPoint(dpi))
                 }
                 val pixmap = page.toPixmap(
                     com.artifex.mupdf.fitz.Matrix(scale, scale),
@@ -1151,7 +1331,8 @@ class MainActivity : AppCompatActivity() {
     private fun renderWithSystemRenderer(
         uri: Uri,
         maxWidthDots: Int,
-        fitHeightDots: Int = 0
+        fitHeightDots: Int = 0,
+        dpi: Int = DEFAULT_DPI
     ): RenderedPage {
         val descriptor = runCatching { contentResolver.openFileDescriptor(uri, "r") }.getOrNull()
             ?: ParcelFileDescriptor.open(
@@ -1167,7 +1348,7 @@ class MainActivity : AppCompatActivity() {
                     val scale = if (fitHeightDots > 0) {
                         minOf(maxWidthDots.toFloat() / pageWidth, fitHeightDots.toFloat() / pageHeight)
                     } else {
-                        minOf(maxWidthDots.toFloat() / pageWidth, DOTS_PER_POINT)
+                        minOf(maxWidthDots.toFloat() / pageWidth, dotsPerPoint(dpi))
                     }
                     val drawWidth = (pageWidth * scale).roundToInt().coerceAtLeast(1)
                     val drawHeight = (pageHeight * scale).roundToInt().coerceAtLeast(1)
@@ -1276,14 +1457,19 @@ class MainActivity : AppCompatActivity() {
         bandDelayMs: Long = DEFAULT_BAND_DELAY_MS,
         gapMm: Int = DEFAULT_GAP_MM,
         paperMm: Int = DEFAULT_PAPER_LENGTH_MM,
-        bandBytes: Int = MAX_BAND_BYTES
+        bandBytes: Int = MAX_BAND_BYTES,
+        dpi: Int = DEFAULT_DPI,
+        speed: Int = DEFAULT_SPEED,
+        density: Int = DEFAULT_DENSITY,
+        mediaType: MediaType = MediaType.GAP
     ): Int {
         // 图纸长走：纸有多长，SIZE 就声明多长。
         // 100mm，换 150mm 纸时必须跟着变，否则走纸账本永远对不上。
         val sheetMm = paperMm.coerceIn(MIN_PAPER_LENGTH_MM, MAX_PAPER_LENGTH_MM)
         val segLimitMm = if (segmentMm > 0) minOf(segmentMm, sheetMm) else sheetMm
-        val paperDots = sheetMm * DOTS_PER_MM
-        val segRows = (segLimitMm * DOTS_PER_MM).coerceAtLeast(1)
+        val dotScale = dotsPerMm(dpi)
+        val paperDots = sheetMm * dotScale
+        val segRows = (segLimitMm * dotScale).coerceAtLeast(1)
         // 不裁剪也不缩放：整页 1:1 照发，效果和 Chrome/打印驱动一致（页面下面的空白照留）。
         // 唯一做的一件通用处理：末尾「整幅纯白」的那一张不占纸 —— 否则 100×150 的画布
         // 配 100mm 纸，会额外吐一张全白标签。顶部/中间的空白照旧保留，不会被上移。
@@ -1298,14 +1484,14 @@ class MainActivity : AppCompatActivity() {
         while (y < contentEnd) {
             val rows = minOf(segRows, paperDots, contentEnd - y)
             // 尾巴只剩一点点时不值得再占一张纸
-            if (contentEnd - y < MIN_SEGMENT_DOTS && page > 0) break
+            if (contentEnd - y < MIN_SEGMENT_MM * dotScale && page > 0) break
             page++
 
             // 1. 每幅重新声明纸张尺寸并清画布，BITMAP 的 Y 坐标按幅内从 0 计。
             transport.write(
                 ("SIZE ${labelSize.widthMm} mm, $sheetMm mm\r\n" +
-                    "GAP $gapMm mm, 0 mm\r\nCLS\r\n" +
-                    "DENSITY 8\r\nSPEED 4\r\nDIRECTION 0\r\n").toByteArray(Charsets.US_ASCII)
+                    mediaCommand(mediaType, gapMm) + "\r\nCLS\r\n" +
+                    "DENSITY $density\r\nSPEED $speed\r\nDIRECTION 0\r\n").toByteArray(Charsets.US_ASCII)
             )
             // 让打印机消化完设置指令再灌点阵，部分机型连着收会丢掉 BITMAP 头
             Thread.sleep(150)
@@ -1394,8 +1580,20 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
+    /** 标签打印机通常以 8/12 dot per mm 标称 203/300 DPI。 */
+    private fun dotsPerMm(dpi: Int): Int = if (dpi >= 300) 12 else 8
+
+    private fun dotsPerPoint(dpi: Int): Float = dotsPerMm(dpi) * 25.4f / 72f
+
+    private fun mediaCommand(mediaType: MediaType, gapMm: Int): String =
+        if (mediaType == MediaType.GAP) "GAP $gapMm mm, 0 mm" else mediaType.tsplCommand()
+
     companion object {
-        private const val DOTS_PER_MM = 8
+        private const val DEFAULT_DPI = 203
+        private const val DEFAULT_SPEED = 4
+        private const val DEFAULT_DENSITY = 8
+        private const val DEFAULT_BLACK_MARK_MM = 2
+        private const val PRINT_SETTINGS_PREFS = "printer_settings"
         private const val REQ_BLUETOOTH = 101
         private const val DEFAULT_BAND_ROWS = 100
         private const val DEFAULT_BAND_DELAY_MS = 250L
@@ -1406,12 +1604,9 @@ class MainActivity : AppCompatActivity() {
         // 这样每幅都从纸头起打。设为 0 会变成连续纸模式，走纸靠 SIZE 累加，误差会累积。
         private const val DEFAULT_GAP_MM = 2
         // 尾部不足这个行数就直接丢弃，避免为最后 1mm 白占一整张纸
-        private const val MIN_SEGMENT_DOTS = 40
+        private const val MIN_SEGMENT_MM = 5
         // 调试入口的默认纸长（mm）
         private const val DEFAULT_PAPER_LENGTH_MM = 100
-        // PDF 的 1 点（1/72 英寸）在 203dpi 下等于多少点
-        private const val DOTS_PER_POINT = DOTS_PER_MM * 25.4f / 72f
-
         // 纸张长度的合理范围（mm）。真实纸长由「纸张规格」决定
         //换 150 的纸就应该按 150 声明 SIZE。
         private const val MIN_PAPER_LENGTH_MM = 10
