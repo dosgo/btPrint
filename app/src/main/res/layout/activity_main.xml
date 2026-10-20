@@ -17,11 +17,12 @@
         android:text="1. 选择汉印 N41 蓝牙设备"
         android:textStyle="bold" />
 
-    <Spinner
-        android:id="@+id/spinnerDevices"
+    <LinearLayout
+        android:id="@+id/deviceListContainer"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="8dp" />
+        android:layout_marginTop="8dp"
+        android:orientation="vertical" />
 
     <TextView
         android:id="@+id/tvBtState"

@@ -30,6 +30,8 @@ import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.RadioButton
 import android.widget.Spinner
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
@@ -51,7 +53,7 @@ import kotlin.concurrent.thread
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var spinnerDevices: Spinner
+    private lateinit var deviceListContainer: LinearLayout
     private lateinit var spinnerLabelSize: Spinner
     private lateinit var spinnerDpi: Spinner
     private lateinit var spinnerSpeed: Spinner
@@ -68,8 +70,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnPrint: Button
     private lateinit var btnTestPrint: Button
     private lateinit var btnRefreshDevices: Button
-    private lateinit var deviceAdapter: ArrayAdapter<String>
     private var loadingPrintSettings = false
+    private var selectedDeviceAddress: String? = null
 
     // 打印锁：整条链路（渲染 → 连接 → 分幅下发 → 走纸）是串行的，
     // 重复点击会让第二份指令插进蓝牙栈，打印机要么丢数据要么锁死。
@@ -205,7 +207,7 @@ class MainActivity : AppCompatActivity() {
             insets
         }
 
-        spinnerDevices = findViewById(R.id.spinnerDevices)
+        deviceListContainer = findViewById(R.id.deviceListContainer)
         spinnerLabelSize = findViewById(R.id.spinnerLabelSize)
         spinnerDpi = findViewById(R.id.spinnerDpi)
         spinnerSpeed = findViewById(R.id.spinnerSpeed)
@@ -218,12 +220,6 @@ class MainActivity : AppCompatActivity() {
         tvBtState = findViewById(R.id.tvBtState)
         etCopies = findViewById(R.id.etCopies)
         cbScaleToPaper = findViewById(R.id.cbScaleToPaper)
-        deviceAdapter = ArrayAdapter(
-            this,
-            android.R.layout.simple_spinner_dropdown_item,
-            mutableListOf<String>()
-        )
-        spinnerDevices.adapter = deviceAdapter
 
         spinnerDpi.adapter = ArrayAdapter(
             this, android.R.layout.simple_spinner_dropdown_item,
@@ -243,13 +239,6 @@ class MainActivity : AppCompatActivity() {
         )
         setPrintSettingsSelections(PrintSettings())
 
-        spinnerDevices.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                loadPrintSettingsForSelectedDevice()
-            }
-
-            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
-        }
         spinnerDpi.onItemSelectedListener = printSettingListener(rerenderPreview = true)
         spinnerSpeed.onItemSelectedListener = printSettingListener(rerenderPreview = false)
         spinnerDensity.onItemSelectedListener = printSettingListener(rerenderPreview = false)
@@ -431,7 +420,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun selectedPrinterSettingsKey(): String =
-        deviceList.getOrNull(spinnerDevices.selectedItemPosition)?.address ?: "default"
+        selectedDevice()?.address ?: "default"
 
     private fun loadPrintSettingsForSelectedDevice() {
         val key = selectedPrinterSettingsKey()
@@ -711,9 +700,7 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("MissingPermission")
     private fun refreshDeviceList() {
         val adapter = bluetoothAdapter ?: return
-        val previousAddress = deviceList
-            .getOrNull(spinnerDevices.selectedItemPosition)
-            ?.address
+        val previousAddress = selectedDeviceAddress
         foundDevices.clear()
         runCatching {
             adapter.bondedDevices?.forEach { foundDevices[it.address] = it }
@@ -724,7 +711,7 @@ class MainActivity : AppCompatActivity() {
             "过滤后列表 ${deviceList.size} 台：" +
                 deviceList.joinToString { "${safeDeviceName(it)}(${it.address})" }
         )
-        updateDeviceSpinner(previousAddress)
+        updateDeviceList(previousAddress)
         registerDiscoveryReceiver()
         startDiscovery(adapter)
     }
@@ -736,7 +723,7 @@ class MainActivity : AppCompatActivity() {
                 tvBtState.text = "扫描启动失败，请检查蓝牙开关与定位权限"
                 return
             }
-            tvBtState.text = "正在搜索蓝牙设备…（已配对 ${foundDevices.size} 个）"
+            tvBtState.text = "正在搜索蓝牙打印机…"
         } catch (e: SecurityException) {
             tvBtState.text = "缺少扫描权限：${e.message}"
         }
@@ -755,53 +742,142 @@ class MainActivity : AppCompatActivity() {
                             intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE) as? BluetoothDevice
                         } ?: return
                         foundDevices[dev.address] = dev
-                        updateDeviceSpinner()
+                        updateDeviceList()
                     }
                     BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
-                        tvBtState.text =
-                            "搜索结束，列表 ${deviceList.size} 台（共发现 ${foundDevices.size} 台蓝牙设备）"
+                        tvBtState.text = "搜索结束，找到 ${deviceList.size} 台可能的打印机"
+                    }
+                    BluetoothDevice.ACTION_BOND_STATE_CHANGED -> {
+                        val dev = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            intent.getParcelableExtra(
+                                BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java
+                            )
+                        } else {
+                            @Suppress("DEPRECATION")
+                            intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE) as? BluetoothDevice
+                        } ?: return
+                        foundDevices[dev.address] = dev
+                        updateDeviceList(selectedDeviceAddress ?: dev.address)
+                        when (intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, -1)) {
+                            BluetoothDevice.BOND_BONDING -> tvBtState.text =
+                                "正在配对 ${safeDeviceName(dev)}…请确认系统弹窗"
+                            BluetoothDevice.BOND_BONDED -> tvBtState.text =
+                                "${safeDeviceName(dev)} 已配对，可以直接打印"
+                            BluetoothDevice.BOND_NONE -> tvBtState.text =
+                                "${safeDeviceName(dev)} 未配对或配对失败"
+                        }
                     }
                 }
             }
         }
         val filter = IntentFilter().apply {
             addAction(BluetoothDevice.ACTION_FOUND)
+            addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
             addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
         }
         ContextCompat.registerReceiver(this, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
         discoveryReceiver = receiver
     }
 
-    private fun updateDeviceSpinner(preferredAddress: String? = null) {
+    @SuppressLint("MissingPermission")
+    private fun updateDeviceList(preferredAddress: String? = null) {
         val devices = deviceList
-        val previousAddress = preferredAddress ?: spinnerDevices.selectedItemPosition
-            .takeIf { it >= 0 }
-            ?.let { devices.getOrNull(it)?.address }
+        val oldSelection = selectedDeviceAddress
+        selectedDeviceAddress = preferredAddress?.takeIf { wanted ->
+            devices.any { it.address == wanted }
+        } ?: oldSelection?.takeIf { wanted ->
+            devices.any { it.address == wanted }
+        } ?: devices.firstOrNull()?.address
 
-        val names = if (devices.isEmpty()) {
-            // 空列表时给一行提示，否则下拉框是空白的，用户会以为扫描坏了
-            listOf("未发现蓝牙设备，点上方按钮重新搜索")
-        } else {
-            devices.map { dev ->
-                val kind = when {
-                    dev.type == BluetoothDevice.DEVICE_TYPE_LE -> " [LE]"
-                    dev.type == BluetoothDevice.DEVICE_TYPE_DUAL -> " [双模]"
-                    dev.type == BluetoothDevice.DEVICE_TYPE_CLASSIC -> " [经典]"
-                    else -> ""
+        deviceListContainer.removeAllViews()
+        if (devices.isEmpty()) {
+            deviceListContainer.addView(TextView(this).apply {
+                text = "未发现蓝牙打印机，点「刷新 / 搜索」重试"
+                setTextColor(Color.DKGRAY)
+                textSize = 13f
+                setPadding(0, dp(8), 0, dp(8))
+            })
+            return
+        }
+
+        devices.forEach { device ->
+            val bondState = runCatching { device.bondState }.getOrDefault(BluetoothDevice.BOND_NONE)
+            val kind = when (device.type) {
+                BluetoothDevice.DEVICE_TYPE_LE -> "LE"
+                BluetoothDevice.DEVICE_TYPE_DUAL -> "双模"
+                BluetoothDevice.DEVICE_TYPE_CLASSIC -> "经典蓝牙"
+                else -> "蓝牙"
+            }
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = android.view.Gravity.CENTER_VERTICAL
+                setPadding(0, dp(2), 0, dp(2))
+            }
+            val selector = RadioButton(this).apply {
+                text = "${safeDeviceName(device)}  [$kind]\n${device.address}"
+                isChecked = device.address == selectedDeviceAddress
+                isEnabled = !isPrinting
+                setOnClickListener {
+                    if (selectedDeviceAddress != device.address) {
+                        selectedDeviceAddress = device.address
+                        loadPrintSettingsForSelectedDevice()
+                        updateDeviceList(device.address)
+                    }
                 }
-                "${safeDeviceName(dev)} (${dev.address})$kind"
+            }
+            row.addView(selector, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            row.addView(Button(this).apply {
+                text = when (bondState) {
+                    BluetoothDevice.BOND_BONDED -> "已配对"
+                    BluetoothDevice.BOND_BONDING -> "配对中…"
+                    else -> "配对"
+                }
+                isEnabled = !isPrinting && bondState == BluetoothDevice.BOND_NONE
+                setOnClickListener { pairDevice(device) }
+            }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            deviceListContainer.addView(row)
+        }
+        if (oldSelection != selectedDeviceAddress) loadPrintSettingsForSelectedDevice()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun pairDevice(device: BluetoothDevice) {
+        if (isPrinting) {
+            tvBtState.text = "打印中，暂不能配对设备"
+            return
+        }
+        if (!hasBluetoothPermissions()) {
+            checkAndRequestPermissions()
+            return
+        }
+        selectedDeviceAddress = device.address
+        when (device.bondState) {
+            BluetoothDevice.BOND_BONDED -> {
+                tvBtState.text = "${safeDeviceName(device)} 已配对，无需重复操作"
+            }
+            BluetoothDevice.BOND_BONDING -> {
+                tvBtState.text = "${safeDeviceName(device)} 正在配对…"
+            }
+            else -> {
+                runCatching { bluetoothAdapter?.cancelDiscovery() }
+                val started = runCatching { device.createBond() }.getOrElse { error ->
+                    tvBtState.text = "无法发起配对：${error.message}"
+                    false
+                }
+                tvBtState.text = if (started) {
+                    "已发起 ${safeDeviceName(device)} 的系统配对，请确认弹窗"
+                } else {
+                    "配对未启动，请让打印机进入可发现状态后重试"
+                }
             }
         }
-
-        deviceAdapter.clear()
-        deviceAdapter.addAll(names)
-        deviceAdapter.notifyDataSetChanged()
-        previousAddress?.let { addr ->
-            devices.indexOfFirst { it.address == addr }
-                .takeIf { it >= 0 }
-                ?.let { spinnerDevices.setSelection(it) }
-        }
+        updateDeviceList(device.address)
     }
+
+    private fun selectedDevice(): BluetoothDevice? =
+        deviceList.firstOrNull { it.address == selectedDeviceAddress }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).roundToInt()
 
     @SuppressLint("MissingPermission")
     private fun safeDeviceName(dev: BluetoothDevice): String =
@@ -851,7 +927,6 @@ class MainActivity : AppCompatActivity() {
         btnTestPrint.isEnabled = !busy
         btnRefreshDevices.isEnabled = !busy
         btnSelectPdf.isEnabled = !busy
-        spinnerDevices.isEnabled = !busy
         spinnerLabelSize.isEnabled = !busy
         spinnerDpi.isEnabled = !busy
         spinnerSpeed.isEnabled = !busy
@@ -860,8 +935,10 @@ class MainActivity : AppCompatActivity() {
         cbScaleToPaper.isEnabled = !busy
         etCopies.isEnabled = !busy
         btnPrint.text = if (busy) "打印中…（请等待）" else "4. 开始高清打印"
+        updateDeviceList(selectedDeviceAddress)
     }
 
+    @SuppressLint("MissingPermission")
     private fun startPrintFlow() {
         // 先抢锁再校验：打印中点击应该提示"还没打完"，而不是被当成参数错误
         if (!acquirePrintLock("打印 PDF")) return
@@ -871,7 +948,7 @@ class MainActivity : AppCompatActivity() {
             releasePrintLock()
             return
         }
-        val targetDevice = deviceList.getOrNull(spinnerDevices.selectedItemPosition)
+        val targetDevice = selectedDevice()
         if (targetDevice == null) {
             tvLog.text = "请先选择一个蓝牙打印机（点上方刷新重新搜索）"
             Log.w("BtPrint", "设备列表为空，无法打印。当前列表大小=${deviceList.size}")
@@ -955,7 +1032,7 @@ class MainActivity : AppCompatActivity() {
     private fun startTestPrint() {
         if (!acquirePrintLock("发送测试页")) return
         val settings = selectedPrintSettings()
-        val targetDevice = deviceList.getOrNull(spinnerDevices.selectedItemPosition)
+        val targetDevice = selectedDevice()
         if (targetDevice == null) {
             tvLog.text = "请先选择一个蓝牙打印机（点上方刷新重新搜索）"
             Log.w("BtPrint", "设备列表为空，无法发测试页")
