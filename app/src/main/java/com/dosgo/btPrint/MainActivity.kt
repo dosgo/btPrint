@@ -156,7 +156,7 @@ class MainActivity : AppCompatActivity() {
         LabelSize(50, 30)    // 已实测能正常出纸的规格
     )
     private val dpiOptions = listOf(203, 300)
-    private val speedOptions = listOf(3, 4, 5, 6)
+    private val speedOptions = listOf(2, 3, 4, 5)
     private val densityOptions = (4..12).toList()
     private val mediaTypeOptions = MediaType.entries
 
@@ -231,7 +231,7 @@ class MainActivity : AppCompatActivity() {
         )
         spinnerSpeed.adapter = ArrayAdapter(
             this, android.R.layout.simple_spinner_dropdown_item,
-            speedOptions.map { it.toString() }
+            speedOptions.map { "$it（约 ${(it * 25.4f).roundToInt()} 毫米/秒）" }
         )
         spinnerDensity.adapter = ArrayAdapter(
             this, android.R.layout.simple_spinner_dropdown_item,
@@ -420,7 +420,10 @@ class MainActivity : AppCompatActivity() {
     private fun setPrintSettingsSelections(settings: PrintSettings) {
         loadingPrintSettings = true
         spinnerDpi.setSelection(dpiOptions.indexOf(settings.dpi).coerceAtLeast(0))
-        spinnerSpeed.setSelection(speedOptions.indexOf(settings.speed).coerceAtLeast(0))
+        spinnerSpeed.setSelection(
+            speedOptions.indexOf(settings.speed).takeIf { it >= 0 }
+                ?: speedOptions.indexOf(DEFAULT_SPEED)
+        )
         spinnerDensity.setSelection(densityOptions.indexOf(settings.density).coerceAtLeast(0))
         spinnerMediaType.setSelection(mediaTypeOptions.indexOf(settings.mediaType).coerceAtLeast(0))
         // Spinner 的选择回调可能延迟到下一帧；届时再解除保护，避免载入值被当成用户修改。
